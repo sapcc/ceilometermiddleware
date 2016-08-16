@@ -18,8 +18,7 @@ import six
 
 from ceilometermiddleware import swift
 from ceilometermiddleware.tests import base as tests_base
-import eventlet
-from eventlet import event
+from threading import Event
 
 
 class FakeApp(object):
@@ -66,17 +65,11 @@ class TestSwift(tests_base.TestCase):
         super(TestSwift, self).setUp()
         cfg.CONF([], project='ceilometermiddleware')
         self.addCleanup(cfg.CONF.reset)
-        self.addCleanup(TestSwift.kill_threads)
+        self.addCleanup(TestSwift.reset_swift_event_queue)
 
     @staticmethod
-    def kill_threads():
-        if swift.Swift.queue_watchdog_thread:
-            swift.Swift.queue_watchdog_thread.kill()
-            swift.Swift.queue_watchdog = None
-            swift.Swift.event_queue = None
-        if swift.Swift.event_sender_thread:
-            swift.Swift.event_sender.die(swift.Swift.event_sender_thread)
-            swift.Swift.event_sender = None
+    def reset_swift_event_queue():
+        swift.Swift.event_queue = None
 
     @staticmethod
     def start_response(*args):
@@ -102,14 +95,14 @@ class TestSwift(tests_base.TestCase):
             self.assertEqual('get', data[2]['target']['action'])
 
     def test_get_background(self):
-        notified = event.Event()
+        notified = Event()
         app = swift.Swift(FakeApp(),
                           {"nonblocking_notify": "True",
                            "send_queue_size": "1"})
         req = FakeRequest('/1.0/account/container/obj',
                           environ={'REQUEST_METHOD': 'GET'})
         with mock.patch('oslo_messaging.Notifier.info',
-                        side_effect=lambda *args, **kwargs: notified.send(True)
+                        side_effect=lambda *args, **kwargs: notified.set()
                         ) as notify:
             resp = app(req.environ, self.start_response)
             self.assertEqual(["This string is 28 bytes long"], list(resp))
@@ -135,12 +128,11 @@ class TestSwift(tests_base.TestCase):
         def timeout_first_try(notified):
             if self.do_timeout:
                 self.do_timeout = False
-                with eventlet.timeout.Timeout(self.send_delay, False):
-                    notified.wait()
+                notified.wait(self.send_delay)
             else:
-                notified.send(True)
+                notified.set()
 
-        notified = event.Event()
+        notified = Event()
         app = swift.Swift(FakeApp(),
                           {"nonblocking_notify": "True",
                            "send_queue_size": "1",
