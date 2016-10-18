@@ -42,9 +42,6 @@ before "proxy-server" and add the following filter in the file:
     # How long (secs) to wait for an event to be sent in background thread
     # before starting a new thread to try again
     send_timeout = 30
-    # Queue size for sending notifications in background thread (0=unlimited).
-    # New notifications will be discarded if the queue is full.
-    send_queue_size = 1000
     # Logging level control
     log_level = WARNING
 """
@@ -52,7 +49,14 @@ import datetime
 import functools
 import logging
 
+import multiprocessing
+try:
+    from multiprocessing import SimpleQueue
+except ImportError:
+    from multiprocessing.queues import SimpleQueue
+
 from oslo_config import cfg
+from oslo_config import types
 import oslo_messaging
 from pycadf import event as cadf_event
 from pycadf.helper import api
@@ -62,12 +66,8 @@ from pycadf import resource as cadf_resource
 import six
 import six.moves.queue as queue
 import six.moves.urllib.parse as urlparse
-import threading
 
-import eventlet
-eventlet.monkey_patch()
-
-_LOG = logging.getLogger(__name__)
+LOG = logging.getLogger(__name__)
 
 
 def _log_and_ignore_error(fn):
@@ -76,8 +76,9 @@ def _log_and_ignore_error(fn):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
-            _LOG.exception('An exception occurred processing '
-                           'the API call: %s ', e)
+            LOG.exception('An exception occurred processing the API call: %s ',
+                          e)
+
     return wrapper
 
 
@@ -114,8 +115,9 @@ class InputProxy(object):
 class Swift(object):
     """Swift middleware used for counting requests."""
 
+    queue_watchdog = None
     event_queue = None
-    threadLock = threading.Lock()
+    processLock = multiprocessing.Lock()
 
     def __init__(self, app, conf):
         self._app = app
@@ -140,7 +142,8 @@ class Swift(object):
         if self.reseller_prefix and self.reseller_prefix[-1] != '_':
             self.reseller_prefix += '_'
 
-        _LOG.setLevel(getattr(logging, conf.get('log_level', 'WARNING')))
+        self.log_level = getattr(logging, conf.get('log_level', 'WARNING'))
+        LOG.setLevel(self.log_level)
 
         # NOTE: If the background thread's send queue fills up, the event will
         #  be discarded
@@ -148,18 +151,17 @@ class Swift(object):
         # For backward compatibility we default to False and therefore wait for
         #  sending to complete. This causes swift proxy to hang if the
         #  destination is unavailable.
-        self.nonblocking_notify = conf.get('nonblocking_notify', False)
-
+        self.nonblocking_notify = types.Boolean()(conf.get(
+            'nonblocking_notify', False))
         # Initialize the sending queue and threads, but only once
         self.send_timeout = float(conf.get('send_timeout', 30.0))
         if self.nonblocking_notify and Swift.event_queue is None:
-            Swift.threadLock.acquire()
+            Swift.processLock.acquire()
             if Swift.event_queue is None:
-                send_queue_size = int(conf.get('send_queue_size', 1000))
-                Swift.event_queue = queue.Queue(send_queue_size)
-                self.start_queue_thread()
-                self.start_sender_thread(self._notifier)
-            Swift.threadLock.release()
+                Swift.event_queue = SimpleQueue()
+                self.done_sending = multiprocessing.Event()
+                self.start_queue_process()
+            Swift.processLock.release()
 
     def __call__(self, env, start_response):
         start_response_args = [None]
@@ -285,111 +287,106 @@ class Swift(object):
 
         if self.nonblocking_notify:
             try:
-                _LOG.debug('Swift: Adding event %s to send queue', event.id)
-                self.event_queue.put(event, False)
-                if not self.event_sender.is_alive():
-                    Swift.threadLock.acquire()
-                    self.start_sender_thread(self._notifier)
-                    Swift.threadLock.release()
-                if not self.queue_watchdog.is_alive():
-                    Swift.threadLock.acquire()
-                    self.start_queue_thread()
-                    Swift.threadLock.release()
+                LOG.debug('Swift: Adding event %s to send queue', event.id)
+                Swift.event_queue.put(event)
+                LOG.debug('Swift: Added event %s to send queue', event.id)
             except queue.Full:
-                _LOG.warning('Swift: Send queue FULL: Event %s not added',
-                             event.id)
+                LOG.warning('Send queue FULL: Event %s not added', event.id)
         else:
-            self.send_notification(self._notifier, event)
+            self.send_notification(self._notifier, event, LOG)
 
-    def start_queue_thread(self):
-        Swift.queue_watchdog = ProcessQueueThread(self,
-            self.event_queue, self._notifier, self.send_timeout)
-        Swift.queue_watchdog.daemon = True
+    def start_queue_process(self):
+        LOG.debug('Start queue_watchdog process')
+
+        Swift.queue_watchdog = multiprocessing.Process(
+            target=self.processQueueThread,
+            name='processQueueThread',
+            args=(Swift.event_queue,
+                  self._notifier,
+                  self.send_timeout,
+                  self.processLock,
+                  self.done_sending,
+                  self.log_level))
         Swift.queue_watchdog.start()
+        LOG.debug('Started queue_watchdog process')
 
-    def start_sender_thread(self, notifier):
-        Swift.event_sender = SendEventThread(self, notifier)
-        Swift.event_sender.daemon = True
-        Swift.event_sender.start()
+    def start_sender_process(self, notifier):
+        LOG.debug('Start event_sender process')
+        event_buffer = SimpleQueue()
+        event_sender = multiprocessing.Process(
+            target=self.sendEventThread,
+            name='sendEventThread',
+            args=(notifier,
+                  event_buffer,
+                  self.done_sending,
+                  self.log_level))
+        event_sender.daemon = True
+        event_sender.start()
+        LOG.debug('Started event_sender process')
+        return event_buffer
 
-    def send_notification(self, notifier, event):
+    def send_notification(self, notifier, event, log):
         notifier.info({}, 'objectstore.http.request', event.as_dict())
-        _LOG.debug('Swift: notifier.info() completed for event %s.',
-                   event.id)
+        log.debug('Swift: notifier.info() completed for event %s.',
+                  event.id)
 
-
-class ProcessQueueThread(threading.Thread):
-
-    def __init__(self, swift, event_queue, notifier, timeout):
-        super(ProcessQueueThread, self).__init__()
-        self.event_queue = event_queue
-        self.notifier = notifier
-        self.timeout = timeout
-        self.swift = swift
-
-    def run(self):
+    def processQueueThread(self, event_queue, notifier, timeout,
+                           processLock, done_sending, log_level):
         """Send events without blocking swift proxy."""
+        log = multiprocessing.log_to_stderr()
+        log.setLevel(log_level)
+        event_buffer = self.start_sender_process(self._notifier)
         while True:
             try:
-                _LOG.debug('ProcessQueue: Wait for event from send queue')
-                event = self.event_queue.get()
-                _LOG.debug('ProcessQueue: Got event %s from queue - trigger '
-                           'send', event.id)
-                done_sending = Swift.event_sender.trigger_send(event)
-                while done_sending.wait(self.timeout) is \
-                     False and Swift.event_sender.event_to_send is not None:
-                  _LOG.warning('ProcessQueue: Timeout sending event %s - '
-                               'retry in new thread.',
-                               event.id)
-                  Swift.threadLock.acquire()
-                  Swift.event_sender.die()
-                  self.swift.start_sender_thread(self.notifier)
-                  Swift.threadLock.release()
-                  done_sending = Swift.event_sender.trigger_send(event)
-            except BaseException as e:
-                _LOG.error("ProcessQueue: Exception in sending thread: %s",
-                           e.message)
-                _LOG.exception("ProcessQueue: SendEventThread loop exception")
+                log.debug('Wait for event from send queue')
+                event = event_queue.get()
+                if event:
+                    log.debug('Got event %s from queue - trigger '
+                              'send', event.id)
+                    self.trigger_send(event, event_buffer, done_sending,
+                                      log)
+                    while done_sending.wait(timeout) is False:
+                        log.warning('Timeout sending event %s - '
+                                    'retry in new thread.', event.id)
+                        processLock.acquire()
+                        self.event_sender_die(event_buffer,
+                                              done_sending)
+                        event_buffer = self.start_sender_process(notifier)
+                        processLock.release()
+                        self.trigger_send(event, event_buffer,
+                                          done_sending, log)
+                else:
+                    event_buffer.put(None)
+                    break
+            except BaseException:
+                LOG.error("Exception in sending thread",
+                          exc_info=True)
+                LOG.exception("SendEventThread loop exception")
 
+    def trigger_send(self, event, buffer, done_sending, log):
+        log.debug(
+            'Put event to buffer and reset done_sending')
+        buffer.put(event)
+        done_sending.clear()
 
-class SendEventThread(threading.Thread):
+    def event_sender_die(self, event_buffer, done_sending):
+        event_buffer.put(None)
+        done_sending.set()
 
-    def __init__(self, swift, notifier):
-        super(SendEventThread, self).__init__()
-        self.swift = swift
-        self.notifier = notifier
-        self.ready_to_send = threading.Event()
-        self.ready_to_send.clear()
-        self.done_sending = threading.Event()
-        self.event_to_send = None
-        self.alive = True
-
-    def trigger_send(self, event):
-        _LOG.debug(
-            'SendEvent: Set/clear thread events to trigger sending')
-        self.event_to_send = event
-        self.done_sending.clear()
-        self.ready_to_send.set()
-        return self.done_sending
-
-    def die(self):
-        self.alive = False
-        self.event_to_send = None
-        self.ready_to_send.set()
-
-    def run(self):
-        while self.alive:
-            _LOG.debug('SendEvent: Wait for ready_to_send')
-            self.ready_to_send.wait()
-            if self.event_to_send is not None:
-                _LOG.debug('SendEvent: Sending event %s', self.event_to_send.id)
-                self.swift.send_notification(self.notifier, self.event_to_send)
-                self.event_to_send = None
-                if self.alive:
-                    _LOG.debug(
-                        'SendEvent: Reset send trigger thread events')
-                    self.done_sending.set()
-                    self.ready_to_send.clear()
+    def sendEventThread(self, notifier, buffer, done_sending, log_level):
+        log = multiprocessing.get_logger()
+        log.setLevel(log_level)
+        while True:
+            log.debug('Wait item from buffer')
+            event_to_send = buffer.get()
+            if event_to_send is not None:
+                log.debug('Send event %s', event_to_send.id)
+                self.send_notification(notifier, event_to_send, LOG)
+                log.debug(
+                    'done_sending.set()')
+                done_sending.set()
+            else:
+                break
 
 
 def filter_factory(global_conf, **local_conf):
@@ -398,4 +395,5 @@ def filter_factory(global_conf, **local_conf):
 
     def filter(app):
         return Swift(app, conf)
+
     return filter

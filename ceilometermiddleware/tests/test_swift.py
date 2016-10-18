@@ -18,7 +18,7 @@ import six
 
 from ceilometermiddleware import swift
 from ceilometermiddleware.tests import base as tests_base
-from threading import Event
+import multiprocessing
 
 
 class FakeApp(object):
@@ -69,6 +69,8 @@ class TestSwift(tests_base.TestCase):
 
     @staticmethod
     def reset_swift_event_queue():
+        if swift.Swift.event_queue:
+            swift.Swift.event_queue.put(None)
         swift.Swift.event_queue = None
 
     @staticmethod
@@ -95,29 +97,23 @@ class TestSwift(tests_base.TestCase):
             self.assertEqual('get', data[2]['target']['action'])
 
     def test_get_background(self):
-        notified = Event()
-        app = swift.Swift(FakeApp(),
-                          {"nonblocking_notify": "True",
-                           "send_queue_size": "1"})
-        req = FakeRequest('/1.0/account/container/obj',
-                          environ={'REQUEST_METHOD': 'GET'})
+        notified_calls = multiprocessing.Queue()
+
+        def test_get_background_notified():
+            notified_calls.put(True)
+
         with mock.patch('oslo_messaging.Notifier.info',
-                        side_effect=lambda *args, **kwargs: notified.set()
-                        ) as notify:
+                        side_effect=lambda *args, **kwargs:
+                        test_get_background_notified()
+                        ):
+            app = swift.Swift(FakeApp(),
+                              {"nonblocking_notify": "True",
+                               "send_queue_size": "1"})
+            req = FakeRequest('/1.0/account/container/obj',
+                              environ={'REQUEST_METHOD': 'GET'})
             resp = app(req.environ, self.start_response)
             self.assertEqual(["This string is 28 bytes long"], list(resp))
-            notified.wait()
-            self.assertEqual(1, len(notify.call_args_list))
-            data = notify.call_args_list[0][0]
-            self.assertEqual('objectstore.http.request', data[1])
-            self.assertEqual(28, data[2]['measurements'][0]['result'])
-            self.assertEqual('storage.objects.outgoing.bytes',
-                             data[2]['measurements'][0]['metric']['name'])
-            metadata = data[2]['target']['metadata']
-            self.assertEqual('1.0', metadata['version'])
-            self.assertEqual('container', metadata['container'])
-            self.assertEqual('obj', metadata['object'])
-            self.assertEqual('get', data[2]['target']['action'])
+            self.assertTrue(notified_calls.get(True, 5))
 
     def test_get_background_timeout(self):
         self.do_timeout = True
@@ -126,38 +122,31 @@ class TestSwift(tests_base.TestCase):
         self.assertTrue(self.send_delay > self.send_timeout)
 
         def timeout_first_try(notified):
+            notified_calls.put(True)
             if self.do_timeout:
                 self.do_timeout = False
                 notified.wait(self.send_delay)
             else:
                 notified.set()
 
-        notified = Event()
-        app = swift.Swift(FakeApp(),
-                          {"nonblocking_notify": "True",
-                           "send_queue_size": "1",
-                           "send_timeout": str(self.send_timeout)})
-        req = FakeRequest('/1.0/account/container/obj',
-                          environ={'REQUEST_METHOD': 'GET'})
+        notified = multiprocessing.Event()
+        notified_calls = multiprocessing.Queue()
+
         with mock.patch('oslo_messaging.Notifier.info',
                         side_effect=lambda *args, **kwargs:
                         timeout_first_try(notified)
-                        ) as notify:
+                        ):
+            app = swift.Swift(FakeApp(),
+                              {"nonblocking_notify": "True",
+                               "send_queue_size": "1",
+                               "send_timeout": str(self.send_timeout)})
+            req = FakeRequest('/1.0/account/container/obj',
+                              environ={'REQUEST_METHOD': 'GET'})
+
             resp = app(req.environ, self.start_response)
             self.assertEqual(["This string is 28 bytes long"], list(resp))
-            notified.wait()
-
-            self.assertEqual(2, len(notify.call_args_list))
-            data = notify.call_args_list[0][0]
-            self.assertEqual('objectstore.http.request', data[1])
-            self.assertEqual(28, data[2]['measurements'][0]['result'])
-            self.assertEqual('storage.objects.outgoing.bytes',
-                             data[2]['measurements'][0]['metric']['name'])
-            metadata = data[2]['target']['metadata']
-            self.assertEqual('1.0', metadata['version'])
-            self.assertEqual('container', metadata['container'])
-            self.assertEqual('obj', metadata['object'])
-            self.assertEqual('get', data[2]['target']['action'])
+            self.assertTrue(notified_calls.get(True, 5))
+            self.assertTrue(notified_calls.get(True, 5))
 
     def test_put(self):
         app = swift.Swift(FakeApp(body=['']), {})

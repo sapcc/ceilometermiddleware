@@ -1,15 +1,13 @@
 ---
 features:
-  - Introduced option to send notifications from a background thread
+  - Introduced option to send notifications from a background process
     instead of blocking the service response to send the
     notification. This option is disabled by default, retaining
     previous behavior. Enable by setting ``nonblocking_notify`` to
     ``True`` in the middleware configuration. When enabled
-    notifications will be queued for delivery in a single thread.
-    Set ``send_queue_size`` to customize the length of this delivery
-    queue (default size 1000).
+    notifications will be queued for delivery in a single process.
     Set ``send_timeout`` in seconds (default 30.0) to customize how
     long to wait for a notification to be sent before trying again
-    in a new thread.
+    in a new process.
   - Introduced option to customize the logging level using the
     ``log_level`` option (default WARNING).
